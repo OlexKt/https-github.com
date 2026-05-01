@@ -1,126 +1,108 @@
 import streamlit as st
-import base64
-import json
-import re
-from openai import OpenAI
+import google.generativeai as genai
 from PIL import Image
 import io
+import json
+import re
 
-# Ініціалізація OpenAI клієнта
-def get_ai_client(api_key):
-    return OpenAI(api_key=api_key)
-
-# Клас для конвертації формул у Unicode [1, 2, 3]
+# Клас для конвертації формул у Unicode [1, 2]
 class UnicodeMath:
     @staticmethod
     def to_unicode(text):
         supers = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
         subs = str.maketrans("0123456789+-=()aeoxhklmnpst", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ")
-        # Перетворення ^2 та _2
         text = re.sub(r'\^(\d|\+|\-|\=|\(|\)|n)', lambda m: m.group(1).translate(supers), text)
         text = re.sub(r'\_(\d|\+|\-|\=|\(|\)|[aeoxhklmnpst])', lambda m: m.group(1).translate(subs), text)
         return text
 
-# Функція для обробки зображень у Base64 [4, 5, 2]
-def encode_image(uploaded_file):
-    return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
+# Налаштування інтерфейсу
+st.set_page_config(page_title="Gemini Teacher Assistant", layout="wide")
+st.title("♊ Gemini AI: Перевірка домашніх завдань")
 
-# Налаштування сторінки Streamlit
-st.set_page_config(page_title="AI Перевірка ДЗ", layout="wide")
-
-st.title("🍎 AI асистент вчителя: Перевірка завдань")
-
-# Бокова панель налаштувань
 with st.sidebar:
     st.header("⚙️ Налаштування")
-    api_key = st.text_input("Введіть OpenAI API Key", type="password")
+    gemini_key = st.text_input("Введіть Google API Key", type="password")
     system_scale = st.selectbox("Система оцінювання", ["12-бальна (Україна)", "5-бальна"])
-    
-    st.divider()
-    st.info("Цей додаток використовує GPT-4o для аналізу фотографій та PDF-файлів робіт студентів.")
+    model_name = st.selectbox("Модель", ["gemini-1.5-flash", "gemini-1.5-pro"])
+    st.info("Flash — швидша та економна. Pro — розумніша для складних задач.")
 
-# Основний інтерфейс
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("1. Завантаження матеріалів")
-    
-    # Завантаження еталона
-    ref_file = st.file_uploader("Завантажте зразок (еталон) розв'язання", type=['jpg', 'png', 'pdf'])
-    
-    # Завантаження робіт студентів (Пакетне завантаження) 
-    student_files = st.file_uploader("Завантажте роботи студентів (можна кілька відразу)", 
-                                    type=['jpg', 'png', 'pdf'], 
+    st.subheader("1. Матеріали")
+    ref_file = st.file_uploader("Завантажте ЕТАЛОН (зразок)", type=['jpg', 'png', 'jpeg', 'pdf'])
+    student_files = st.file_uploader("Завантажте РОБОТИ СТУДЕНТІВ (пакетом)", 
+                                    type=['jpg', 'png', 'jpeg', 'pdf'], 
                                     accept_multiple_files=True)
-    
-    google_doc_link = st.text_input("Або вставте посилання на Google Документ")
+    google_doc = st.text_input("Або посилання на Google Doc")
 
-    # Кнопки вибору режиму [6, 5]
-    mode_col1, mode_col2 = st.columns(2)
-    with mode_col1:
-        strict_mode = st.button("📏 Прийняти правила зразка", use_container_width=True)
-    with mode_col2:
-        flex_mode = st.button("💡 Врахувати зміни у відповіді", use_container_width=True)
+    m_col1, m_col2 = st.columns(2)
+    with m_col1:
+        btn_strict = st.button("📏 Суворо за зразком", use_container_width=True)
+    with m_col2:
+        btn_flex = st.button("💡 Врахувати зміни", use_container_width=True)
 
 with col2:
-    st.subheader("2. Результати перевірки")
+    st.subheader("2. Результати аналізу")
     
-    if (strict_mode or flex_mode) and api_key and ref_file and (student_files or google_doc_link):
-        mode = "strict" if strict_mode else "flexible"
-        client = get_ai_client(api_key)
-        
-        # Обробка кожного студента в пакеті 
-        for idx, s_file in enumerate(student_files or [google_doc_link]):
-            with st.status(f"Перевірка роботи №{idx+1}...", expanded=True) as status:
-                try:
-                    # Підготовка контенту для ШІ
-                    ref_base64 = encode_image(ref_file)
-                    
-                    prompt = f"""Ви — професійний викладач. 
-                    1. ПЕРЕВІРТЕ ЗРАЗОК: якщо в еталоні є помилка, вкажіть на неї в полі 'internal_comment'.
-                    2. ПОРІВНЯЙТЕ: перевірте роботу студента відносно еталона.
-                    3. ОЦІНІТЬ: за системою {system_scale}.
-                    4. РЕЖИМ: {mode} (strict - лише як у зразку, flexible - приймати альтернативні логічні рішення).
-                    
-                    Результат ТІЛЬКИ у JSON:
-                    {{
-                        "grade": "бал",
-                        "errors": "список помилок",
-                        "internal_comment": "аналіз для вчителя (включаючи помилки в еталоні)",
-                        "student_comment": "коментар для Classroom (використовуйте ^2 для степенів)"
-                    }}"""
+    if (btn_strict or btn_flex) and gemini_key:
+        if not ref_file:
+            st.warning("Додайте зразок розв'язання!")
+        else:
+            mode = "strict" if btn_strict else "flexible"
+            model = genai.GenerativeModel(model_name)
+            
+            # Підготовка еталона
+            ref_img = Image.open(ref_file)
+            
+            for idx, s_file in enumerate(student_files or [google_doc]):
+                with st.status(f"Аналіз роботи №{idx+1}...", expanded=True):
+                    try:
+                        # Промпт для Gemini
+                        prompt = f"""Дій як професійний викладач. 
+                        1. Перевір еталон (перше зображення) на помилки. Якщо вони є, вкажи в 'internal_comment'.
+                        2. Порівняй роботу студента (друге зображення або посилання) з еталоном.
+                        3. Оціни за системою {system_scale}.
+                        4. Режим: {mode} (strict - карати за відхилення від методу, flexible - приймати інші вірні шляхи).
+                        
+                        Відповідь надай ВИКЛЮЧНО у форматі JSON:
+                        {{
+                            "grade": "бал",
+                            "errors": "список помилок",
+                            "internal_comment": "аналіз для вчителя",
+                            "student_comment": "короткий коментар (використовуйте ^2 для степенів та _2 для індексів)"
+                        }}"""
 
-                    content = [{"type": "text", "text": prompt}]
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{ref_base64}"}})
-                    
-                    if isinstance(s_file, str): # Посилання
-                        content.append({"type": "text", "text": f"Google Doc: {s_file}"})
-                    else: # Файл
-                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(s_file)}"}})
+                        # Формування запиту залежно від типу вводу
+                        inputs = [prompt, ref_img]
+                        if isinstance(s_file, str):
+                            inputs.append(f"Google Doc Link: {s_file}")
+                        else:
+                            inputs.append(Image.open(s_file))
 
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[{"role": "user", "content": content}],
-                        response_format={"type": "json_object"}
-                    )
-                    
-                    res = json.loads(response.choices.message.content)
-                    
-                    # Виведення результату
-                    st.success(f"Робота {getattr(s_file, 'name', 'за посиланням')} перевірена!")
-                    st.metric("Оцінка", res['grade'])
-                    
-                    with st.expander("Деталі для викладача"):
-                        st.write("**Помилки:**", res['errors'])
-                        st.write("**Внутрішній аналіз:**", res['internal_comment'])
-                    
-                    # Коментар для копіювання з Unicode формулами [1, 2]
-                    clean_comment = UnicodeMath.to_unicode(res['student_comment'])
-                    st.text_area("Коментар для студента (можна копіювати в Classroom):", 
-                                clean_comment, key=f"comment_{idx}")
-                    
-                    st.divider()
-                except Exception as e:
-                    st.error(f"Помилка при обробці: {str(e)}")
-    elif (strict_mode or flex_mode) and not api_key:
-        st.warning("Будь ласка, введіть API Key у боковій панелі.")
+                        response = model.generate_content(inputs)
+                        
+                        # Очищення тексту від можливих маркерів ```json
+                        clean_json = re.sub(r'```json|```', '', response.text).strip()
+                        res = json.loads(clean_json)
+                        
+                        # Відображення
+                        st.success(f"Готово: {getattr(s_file, 'name', 'Google Doc')}")
+                        st.metric("Оцінка", res['grade'])
+                        
+                        with st.expander("Для викладача (помилки та аналіз)"):
+                            st.write(f"**Помилки:** {res['errors']}")
+                            st.write(f"**Аналіз:** {res['internal_comment']}")
+                        
+                        # Коментар з Unicode формулами [3]
+                        final_comment = UnicodeMath.to_unicode(res['student_comment'])
+                        st.text_area("Коментар для Classroom:", final_comment, key=f"res_{idx}")
+                        st.divider()
+                        
+                    except Exception as e:
+                        st.error(f"Помилка: {str(e)}")
+    elif (btn_strict or btn_flex) and not gemini_key:
+        st.error("Будь ласка, введіть API Key у боковій панелі.")
